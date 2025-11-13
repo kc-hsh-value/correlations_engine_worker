@@ -13,7 +13,8 @@ from helpers.embeddings import generate_embeddings
 
 # --- Telegram Imports ---
 from telegram.ext import Application
-from helpers.telegram_bot import setup_telegram_handlers # <-- Our new setup function
+from helpers.telegram_bot import setup_telegram_handlers
+from main import alpha_cycle_loop # <-- Our new setup function
 
 
 load_dotenv()
@@ -23,15 +24,35 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # --- Bot Class Definition ---
 # This structure manages the persistent connection and commands
+# class PolyMarketBot(discord.Client):
+#     def __init__(self, *, intents: discord.Intents):
+#         print("bot is initializing")
+#         super().__init__(intents=intents)
+#         # CommandTree is the modern way to handle slash commands
+#         self.tree = discord.app_commands.CommandTree(self)
+
+#     async def setup_hook(self):
+#         # This copies the global commands to your guild.
+#         await self.tree.sync()
+
+#     async def on_ready(self):
+#         print("on ready just got called")
+#         if self.user:
+#             print(f'Logged in as {self.user} (ID: {self.user.id})')
+#         else:
+#             print('Logged in, but self.user is None')
+#         print('------')
+#         self.loop.create_task(alpha_cycle_loop(self))
+
+# bot.py
+
 class PolyMarketBot(discord.Client):
     def __init__(self, *, intents: discord.Intents):
-        print("bot is initializing")
         super().__init__(intents=intents)
-        # CommandTree is the modern way to handle slash commands
         self.tree = discord.app_commands.CommandTree(self)
+        self._alpha_task = None  # <<< add
 
     async def setup_hook(self):
-        # This copies the global commands to your guild.
         await self.tree.sync()
 
     async def on_ready(self):
@@ -41,8 +62,13 @@ class PolyMarketBot(discord.Client):
         else:
             print('Logged in, but self.user is None')
         print('------')
-        # self.loop.create_task(alpha_cycle_loop(self))
 
+        # <<< guard so we only start the loop once
+        if self._alpha_task is None or self._alpha_task.done():
+            print("[bot] starting alpha_cycle_loop background task…")
+            self._alpha_task = self.loop.create_task(alpha_cycle_loop(self))
+        else:
+            print("[bot] alpha_cycle_loop already running; skip.")
 # --- Bot Instance and Intents ---
 intents = discord.Intents.default()
 bot = PolyMarketBot(intents=intents)

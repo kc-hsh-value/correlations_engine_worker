@@ -9,6 +9,7 @@ import numpy as np
 import requests
 
 from helpers.supabase_client import get_supabase
+from helpers.embeddings import generate_embeddings
 
 # ========= BASIC QUERIES =========
 
@@ -24,26 +25,58 @@ def get_market_count() -> int:
         return 0
     return int(resp.count)
 
-def prune_expired_markets(now_utc: Optional[datetime] = None) -> int:
-    """
-    Marks markets as inactive if end_date_utc < now().
-    Returns number of rows updated.
-    """
-    sb = get_supabase()
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    # PostgREST expects ISO8601
-    now_iso = now_utc.isoformat()
 
-    resp = (
-        sb.table("markets")
-        .update({"is_active": False})
-        .lt("end_date_utc", now_iso)
-        .eq("is_active", True)
-        .execute()
-    )
-    # supabase-py returns affected rows in data length (no count). Best effort:
-    return len(resp.data or [])
+
+# def prune_expired_markets(now_utc: Optional[datetime] = None) -> int:
+#     sb = get_supabase()
+#     if now_utc is None:
+#         now_utc = datetime.now(timezone.utc)
+#     now_iso = now_utc.isoformat()
+
+#     or_filter = ",".join([
+#         f"end_date_utc.lt.{now_iso}",
+#         "full_data_json->>closed.eq.true",
+#         "full_data_json->>umaResolutionStatus.eq.resolved",
+#         "full_data_json->market->>closed.eq.true",
+#         "full_data_json->market->>umaResolutionStatus.eq.resolved",
+#         # event[0]
+#         "full_data_json->events->0->>closed.eq.true",
+#         "full_data_json->events->0->>umaResolutionStatus.eq.resolved",
+#     ])
+
+#     # 1) How many rows match regardless of current is_active?
+#     matched = (
+#         sb.table("markets")
+#         .select("id")
+#         .or_(or_filter)
+#         .execute()
+#     )
+#     matched_ids = [r["id"] for r in (matched.data or [])]
+
+#     # 2) Which of those are still active (to actually update)?
+#     to_update = (
+#         sb.table("markets")
+#         .select("id")
+#         .in_("id", matched_ids)
+#         .eq("is_active", True)
+#         .execute()
+#     )
+#     upd_ids = [r["id"] for r in (to_update.data or [])]
+
+#     # 3) Update in chunks
+#     CHUNK = 1000
+#     for i in range(0, len(upd_ids), CHUNK):
+#         batch = upd_ids[i:i+CHUNK]
+#         sb.table("markets").update({"is_active": False}).in_("id", batch).execute()
+
+#     # return how many were actually flipped from active→inactive
+#     return len(upd_ids)
+
+
+def prune_expired_markets() -> int:
+    sb = get_supabase()
+    res = sb.rpc("prune_markets").execute()
+    return len(res.data or [])
 
 def add_discord_subscription(guild_id: str, channel_id: str, owner_user_id: Optional[str] = None) -> None:
     """
@@ -215,6 +248,9 @@ def insert_markets(markets_data, embeddings) -> int:
         ).execute()
         total += len(batch)
     return total
+
+
+    
 def seed_database_if_empty(generate_embeddings_fn) -> None:
     """
     If markets table is empty, fetch all active markets, embed, and insert.
@@ -243,3 +279,330 @@ def seed_database_if_empty(generate_embeddings_fn) -> None:
     print("[seed] inserting markets…")
     inserted = insert_markets(all_markets, embs)
     print(f"[seed] upserted {inserted} markets.")
+
+
+
+
+# ====== NEW: cycle bookkeeping ======
+
+# helpers/supabase_db.py
+
+def get_next_cycle_number() -> int:
+    """
+    Returns the next cycle_number by selecting the current max and adding 1.
+    Uses a simple ordered select to avoid RPC.
+    """
+    sb = get_supabase()
+    resp = (
+        sb.table("cycle_logs")
+        .select("cycle_number")
+        .order("cycle_number", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if resp.data and resp.data[0].get("cycle_number") is not None:
+        return int(resp.data[0]["cycle_number"]) + 1
+    return 1
+
+def log_cycle_stats(stats: dict) -> None:
+    sb = get_supabase()
+    payload = {
+        "cycle_number": stats.get("cycle_number"),
+        "start_time": stats.get("start_time"),
+        "end_time": stats.get("end_time"),
+        "status": stats.get("status"),
+        "tweets_fetched": stats.get("tweets_fetched", 0),
+        "new_markets_fetched": stats.get("new_markets_fetched", 0),
+        "correlations_found": stats.get("correlations_found", 0),
+        "messages_sent": stats.get("messages_sent", 0),
+        "notes": stats.get("notes"),
+    }
+    sb.table("cycle_logs").insert(payload).execute()
+
+# ====== NEW: accounts to poll ======
+
+def get_pollable_x_accounts() -> List[dict]:
+    """
+    Return active x_accounts that have at least one follower in user_x_follows.
+    Fields: id (uuid), handle (text)
+    """
+    sb = get_supabase()
+    # exists subquery via RPC-free approach: use two queries or a view; here do two-step
+    accounts = (
+        sb.table("x_accounts")
+        .select("id, handle, is_active")
+        .eq("is_active", True)
+        .execute()
+        .data
+        or []
+    )
+    if not accounts:
+        return []
+
+    # Filter to those that have at least one follower
+    ids = [a["id"] for a in accounts]
+    # Fetch follows grouped
+    follows = (
+        sb.table("user_x_follows")
+        .select("x_account_id")
+        .in_("x_account_id", ids)
+        .limit(1_000_000)
+        .execute()
+        .data
+        or []
+    )
+    followed = set([f["x_account_id"] for f in follows])
+    return [a for a in accounts if a["id"] in followed]
+
+# helpers/supabase_db.py
+
+def touch_accounts_last_checked(account_ids: List[str], ts_iso: str) -> None:
+    """
+    Update last_checked_at for existing x_accounts.
+    Never inserts (avoids NULL handle issue).
+    """
+    if not account_ids:
+        return
+    sb = get_supabase()
+    BATCH = 300
+    for i in range(0, len(account_ids), BATCH):
+        chunk = [aid for aid in account_ids[i:i+BATCH] if aid]  # guard empties
+        if not chunk:
+            continue
+        # Update existing rows only
+        sb.table("x_accounts") \
+          .update({"last_checked_at": ts_iso}) \
+          .in_("id", chunk) \
+          .execute()
+
+# ====== NEW: tweets upsert (batched) ======
+
+# def insert_tweets_batched(normalized_tweets: List[dict]) -> int:
+#     """
+#     normalized_tweets fields required:
+#       id, x_account_id, text, tweet_url, author_name, author_url, created_at_utc (ISO), embedding (optional)
+#     """
+#     if not normalized_tweets:
+#         return 0
+
+#     sb = get_supabase()
+#     BATCH = 300
+#     total = 0
+#     for i in range(0, len(normalized_tweets), BATCH):
+#         batch = normalized_tweets[i:i+BATCH]
+#         # ensure embedding is list or None
+#         for t in batch:
+#             emb = t.get("embedding")
+#             if hasattr(emb, "tolist"):
+#                 t["embedding"] = emb.tolist()
+#         sb.table("tweets").upsert(
+#             batch,
+#             on_conflict="id",
+#             returning="minimal",
+#         ).execute()
+#         total += len(batch)
+#     return total
+
+
+
+# helpers/supabase_db.py
+
+
+def insert_tweets_batched(normalized_tweets: list[dict]) -> int:
+    """
+    normalized_tweets required fields:
+      id, x_account_id, text, tweet_url, author_name, author_url, created_at_utc (ISO)
+    optional:
+      embedding (list[float]) — if missing, we will generate
+    """
+    if not normalized_tweets:
+        return 0
+
+    # 1) Build a parallel list of texts to embed
+    to_embed_idx = []
+    to_embed_texts = []
+    for idx, t in enumerate(normalized_tweets):
+        emb = t.get("embedding")
+        if emb is None or (hasattr(emb, "__len__") and len(emb) == 0):
+            # sanitize text
+            txt = (t.get("text") or "").replace("\n", " ").strip()
+            if txt:
+                to_embed_idx.append(idx)
+                to_embed_texts.append(txt)
+
+    # 2) Generate embeddings (batched) for those needing it
+    if to_embed_texts:
+        embs = generate_embeddings(to_embed_texts)  # returns list[np.ndarray]
+        # 3) Patch them back on the rows
+        for i, emb in zip(to_embed_idx, embs):
+            normalized_tweets[i]["embedding"] = (
+                emb.tolist() if hasattr(emb, "tolist") else emb
+            )
+
+    # 4) Upsert in chunks
+    sb = get_supabase()
+    BATCH = 300
+    total = 0
+    for i in range(0, len(normalized_tweets), BATCH):
+        batch = normalized_tweets[i:i+BATCH]
+        # Ensure JSON-serializable embedding
+        for t in batch:
+            emb = t.get("embedding")
+            if hasattr(emb, "tolist"):
+                t["embedding"] = emb.tolist()
+        sb.table("tweets").upsert(
+            batch,
+            on_conflict="id",
+            returning="minimal",
+        ).execute()
+        total += len(batch)
+    return total
+
+# helpers/supabase_db.py
+
+# helpers/supabase_db.py
+
+def normalize_handle(h: str) -> str:
+    return (h or "").strip().lstrip("@").lower()
+
+def ensure_x_accounts_for_handles(handles: list[str]) -> dict[str, str]:
+    """
+    Ensure each handle exists in x_accounts and return a mapping {handle_lower: id}.
+    Skips empty/invalid handles to avoid NOT NULL violations.
+    """
+    sb = get_supabase()
+
+    # sanitize & dedupe
+    clean = []
+    for h in handles or []:
+        n = normalize_handle(h)
+        if n:  # keep only non-empty after normalization
+            clean.append(n)
+    clean = sorted(set(clean))
+
+    if not clean:
+        return {}
+
+    # 1) fetch existing
+    existing_rows = (
+        sb.table("x_accounts")
+        .select("id, handle")
+        .in_("handle", clean)
+        .execute()
+        .data or []
+    )
+    handle_to_id = {normalize_handle(r["handle"]): r["id"] for r in existing_rows if r.get("handle")}
+
+    # 2) upsert missing (STRICTLY valid handles only)
+    missing = [h for h in clean if h not in handle_to_id]
+    if missing:
+        payload = [{"handle": h, "is_active": True} for h in missing if h]  # guard!
+        if payload:
+            sb.table("x_accounts").upsert(
+                payload,
+                on_conflict="handle",
+                returning="minimal",
+            ).execute()
+
+        # 3) reselect to get IDs (covers both existing + newly inserted)
+        refreshed = (
+            sb.table("x_accounts")
+            .select("id, handle")
+            .in_("handle", clean)
+            .execute()
+            .data or []
+        )
+        handle_to_id = {normalize_handle(r["handle"]): r["id"] for r in refreshed if r.get("handle")}
+
+    return handle_to_id
+
+
+
+def attach_x_account_ids_to_tweets(tweets: list[dict]) -> list[dict]:
+    """
+    For any tweet missing x_account_id, infer handle and attach the id.
+    """
+    # collect handles we can infer
+    handles = []
+    for t in tweets:
+        if t.get("x_account_id"):
+            continue
+        h = t.get("_source_handle") or (t.get("author_url") or "").rsplit("/", 1)[-1]
+        if h:
+            handles.append(h)
+
+    handle_to_id = ensure_x_accounts_for_handles(handles)
+    # patch
+    for t in tweets:
+        if not t.get("x_account_id"):
+            h = t.get("_source_handle") or (t.get("author_url") or "").rsplit("/", 1)[-1]
+            hid = handle_to_id.get(normalize_handle(h))
+            if hid:
+                t["x_account_id"] = hid
+    return tweets
+
+
+
+def get_existing_market_ids(ids: list[str]) -> set[str]:
+    if not ids:
+        return set()
+    sb = get_supabase()
+    existing = (
+        sb.table("markets")
+        .select("id")
+        .in_("id", ids)
+        .execute()
+        .data or []
+    )
+    return {row["id"] for row in existing if row.get("id")}
+
+
+
+# helpers/supabase_db.py (append these)
+
+def get_unprocessed_tweets_batch(limit: int = 40) -> list[dict]:
+    sb = get_supabase()
+    res = sb.table("tweets").select(
+        "id,text,embedding,created_at_utc"
+    ).eq("is_processed", False).order("created_at_utc", desc=False).limit(limit).execute()
+    return res.data or []
+
+def upsert_tweet_embeddings(id_to_emb: dict[str, list[float]]) -> None:
+    if not id_to_emb:
+        return
+    sb = get_supabase()
+    rows = [{"id": tid, "embedding": emb} for tid, emb in id_to_emb.items()]
+    # upsert — only touching id + embedding
+    sb.table("tweets").upsert(rows, on_conflict="id", returning="minimal").execute()
+
+def rpc_match_markets(query_embedding: list[float], k: int = 50) -> list[dict]:
+    sb = get_supabase()
+    # res = sb.rpc("match_markets", {
+    #     "query_embedding": query_embedding,
+    #     "match_count": k
+    # }).execute()
+    res = sb.rpc("match_markets_v3", {
+        "query_embedding": query_embedding,
+        "match_count": k
+    }).execute()
+    return res.data or []
+
+def upsert_correlations(rows: list[dict]) -> None:
+    """
+    rows require: tweet_id, market_id, relevance_score, relevance_reason,
+    urgency_score, urgency_reason, engine_version, llm_model, tokens_input, tokens_output, latency_ms, metadata, llm_category_name
+    """
+    if not rows:
+        return
+    sb = get_supabase()
+    sb.table("tweet_market_correlations").upsert(
+        rows,
+        on_conflict="tweet_id,market_id",
+        returning="minimal",
+    ).execute()
+
+def mark_tweets_processed(ids: list[str]) -> None:
+    if not ids:
+        return
+    sb = get_supabase()
+    sb.table("tweets").update({"is_processed": True}).in_("id", ids).execute()
