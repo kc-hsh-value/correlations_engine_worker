@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ingestion:
+    build: .
+    command: uv run ingestion_main.py
+    restart: always
+    env_file: .env  # This loads your API keys & DB URL
+
+  pruning:
+    build: .
+    command: uv run prune_main.py
+    restart: always
+    env_file: .env
+
+  twitter:
+    build: .
+    command: uv run twitter_main.py
+    restart: always
+    env_file: .env
+
+  correlations:
+    build: .
+    command: uv run correlations_main.py
+    restart: always
+    env_file: .env

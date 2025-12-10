@@ -4,6 +4,11 @@ import os
 import asyncio
 from dotenv import load_dotenv
 
+# new code to work in the mac mini
+import httpx
+from telegram.request import HTTPXRequest
+
+
 # from main import alpha_cycle_loop # We will refactor main.py into this
 from helpers.supabase_db import (
     add_discord_subscription,
@@ -104,50 +109,109 @@ async def setup(interaction: discord.Interaction):
 
 
 # --- THE NEW MAIN EXECUTION BLOCK ---
+# async def main():
+#     """Initializes and runs both Discord and Telegram bots concurrently."""
+#     # Perform initial setup once at the very start
+#     print("Performing initial setup...")
+#     seed_database_if_empty(generate_embeddings)
+#     print("Initial setup complete.")
+
+#     # Check for necessary tokens
+#     if not DISCORD_BOT_TOKEN:
+#         raise ValueError("DISCORD_BOT_TOKEN_DEV is not set in the environment.")
+#     if not TELEGRAM_BOT_TOKEN:
+#         raise ValueError("TELEGRAM_BOT_TOKEN is not set in the environment.")
+
+#     # 1. Initialize the Telegram Application
+#     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+#     # 2. Register the command handlers from our helper file
+#     setup_telegram_handlers(telegram_app)
+    
+#     # 3. --- Manually start the Telegram bot's components ---
+#     # This sets them up to run in the background on the existing event loop.
+#     print("Initializing Telegram bot...")
+#     await telegram_app.initialize()  # Prepares the application
+    
+#     print("Starting Telegram polling in background...")
+#     await telegram_app.updater.start_polling()  # Starts fetching updates
+    
+#     print("Starting Telegram application in background...")
+#     await telegram_app.start()  # Starts processing updates
+    
+#     # 4. Start the Discord bot in the foreground.
+#     # The `bot.start()` method is a blocking call that keeps the script alive.
+#     # Since the Telegram bot is already running in the background, we just need
+#     # this one call to keep the whole process running.
+#     print("--- Starting Discord bot (will keep all services alive) ---")
+#     await bot.start(DISCORD_BOT_TOKEN)
+
+#     # 5. --- Graceful Shutdown (when bot.start() is cancelled) ---
+#     print("--- Shutting down services ---")
+#     await telegram_app.updater.stop()
+#     await telegram_app.stop()
+#     await telegram_app.shutdown()
+
+
+# bot.py - Add this near the top with other imports
+import httpx
+from telegram.request import HTTPXRequest
+
+# Then modify the Telegram app initialization in your main() function:
+
 async def main():
     """Initializes and runs both Discord and Telegram bots concurrently."""
-    # Perform initial setup once at the very start
     print("Performing initial setup...")
     seed_database_if_empty(generate_embeddings)
     print("Initial setup complete.")
 
-    # Check for necessary tokens
     if not DISCORD_BOT_TOKEN:
-        raise ValueError("DISCORD_BOT_TOKEN_DEV is not set in the environment.")
+        raise ValueError("DISCORD_BOT_TOKEN is not set in the environment.")
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set in the environment.")
 
-    # 1. Initialize the Telegram Application
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # === FIX: Create custom request that binds to Wi-Fi interface ===
+    transport = httpx.AsyncHTTPTransport(
+        local_address="192.168.1.8"  # Your Mac Mini's Wi-Fi IP
+    )
+    
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+    )
+    
+    # Create httpx client with our transport
+    http_client = httpx.AsyncClient(transport=transport, timeout=30.0)
+    request._client = http_client
+    # === END FIX ===
 
-    # 2. Register the command handlers from our helper file
+    # Initialize Telegram with custom request
+    telegram_app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)  # Use our custom request
+        .build()
+    )
+
     setup_telegram_handlers(telegram_app)
     
-    # 3. --- Manually start the Telegram bot's components ---
-    # This sets them up to run in the background on the existing event loop.
     print("Initializing Telegram bot...")
-    await telegram_app.initialize()  # Prepares the application
+    await telegram_app.initialize()
     
     print("Starting Telegram polling in background...")
-    await telegram_app.updater.start_polling()  # Starts fetching updates
+    await telegram_app.updater.start_polling()
     
     print("Starting Telegram application in background...")
-    await telegram_app.start()  # Starts processing updates
+    await telegram_app.start()
     
-    # 4. Start the Discord bot in the foreground.
-    # The `bot.start()` method is a blocking call that keeps the script alive.
-    # Since the Telegram bot is already running in the background, we just need
-    # this one call to keep the whole process running.
     print("--- Starting Discord bot (will keep all services alive) ---")
     await bot.start(DISCORD_BOT_TOKEN)
 
-    # 5. --- Graceful Shutdown (when bot.start() is cancelled) ---
     print("--- Shutting down services ---")
+    await http_client.aclose()  # Clean up our custom client
     await telegram_app.updater.stop()
     await telegram_app.stop()
     await telegram_app.shutdown()
-
-
 if __name__ == '__main__':
     # Use asyncio.run() to start our main async function.
     # This correctly manages the entire lifecycle.

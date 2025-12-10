@@ -26,53 +26,6 @@ def get_market_count() -> int:
     return int(resp.count)
 
 
-
-# def prune_expired_markets(now_utc: Optional[datetime] = None) -> int:
-#     sb = get_supabase()
-#     if now_utc is None:
-#         now_utc = datetime.now(timezone.utc)
-#     now_iso = now_utc.isoformat()
-
-#     or_filter = ",".join([
-#         f"end_date_utc.lt.{now_iso}",
-#         "full_data_json->>closed.eq.true",
-#         "full_data_json->>umaResolutionStatus.eq.resolved",
-#         "full_data_json->market->>closed.eq.true",
-#         "full_data_json->market->>umaResolutionStatus.eq.resolved",
-#         # event[0]
-#         "full_data_json->events->0->>closed.eq.true",
-#         "full_data_json->events->0->>umaResolutionStatus.eq.resolved",
-#     ])
-
-#     # 1) How many rows match regardless of current is_active?
-#     matched = (
-#         sb.table("markets")
-#         .select("id")
-#         .or_(or_filter)
-#         .execute()
-#     )
-#     matched_ids = [r["id"] for r in (matched.data or [])]
-
-#     # 2) Which of those are still active (to actually update)?
-#     to_update = (
-#         sb.table("markets")
-#         .select("id")
-#         .in_("id", matched_ids)
-#         .eq("is_active", True)
-#         .execute()
-#     )
-#     upd_ids = [r["id"] for r in (to_update.data or [])]
-
-#     # 3) Update in chunks
-#     CHUNK = 1000
-#     for i in range(0, len(upd_ids), CHUNK):
-#         batch = upd_ids[i:i+CHUNK]
-#         sb.table("markets").update({"is_active": False}).in_("id", batch).execute()
-
-#     # return how many were actually flipped from active→inactive
-#     return len(upd_ids)
-
-
 def prune_expired_markets() -> int:
     sb = get_supabase()
     res = sb.rpc("prune_markets").execute()
